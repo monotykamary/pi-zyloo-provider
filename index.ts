@@ -1,0 +1,334 @@
+/**
+ * Zyloo Provider Extension
+ *
+ * Registers Zyloo (zyloo.io) as a custom provider using the openai-completions API.
+ * Base URL: https://api.zyloo.io/v1
+ *
+ * Zyloo proxies multiple model families (Anthropic Claude, OpenAI GPT, Google
+ * Gemini, xAI Grok, Moonshot Kimi, Zhipu GLM, DeepSeek, Qwen, MiniMax) through a
+ * single OpenAI-compatible Chat Completions endpoint. The /v1/models endpoint
+ * returns minimal metadata (id + owned_by — no pricing, context lengths, or
+ * reasoning flags). The patch.json file provides these based on the upstream
+ * providers' published specifications.
+ *
+ * Key API characteristics:
+ *   - OpenAI Chat Completions compatible (/v1/chat/completions)
+ *   - Reasoning models return reasoning_content in OpenAI format
+ *   - Both `max_tokens` and `max_completion_tokens` are accepted
+ *   - Developer role supported across models (except native system-role upstreams)
+ *   - reasoning_effort accepted by OpenAI-style reasoning models
+ *
+ * Note: api.zyloo.ai has no DNS A record; the API is served at api.zyloo.io.
+ *       https://zyloo.ai/v1/* 301-redirects to https://api.zyloo.io/v1/*.
+ *
+ * Model resolution strategy: Stale-While-Revalidate
+ *   1. Serve stale immediately: disk cache -> embedded models.json (zero-latency)
+ *   2. Revalidate in background: live API /models -> merge with embedded -> cache -> hot-swap
+ *   3. patch.json + custom-models.json applied on top of whichever source won
+ *
+ * Merge order: [live|cache|embedded] -> apply patch.json -> merge custom-models.json
+ *
+ * Usage:
+ *   # Option 1: Store in auth.json (recommended)
+ *   # Add to ~/.pi/agent/auth.json:
+ *   #   "zyloo": { "type": "api_key", "key": "your-api-key" }
+ *
+ *   # Option 2: Set as environment variable
+ *   export ZYLOO_API_KEY=your-api-key
+ *
+ *   # Run pi with the extension
+ *   pi -e /path/to/pi-zyloo-provider
+ *
+ * Then use /model to select from available models like Claude Opus 4.8,
+ * GPT-5.5, Gemini 3.1 Pro, Grok 4.3, Kimi K2.6, GLM-5.2, DeepSeek V4 Pro, and more.
+ *
+ * @see https://zyloo.io
+ */
+
+import { getAgentDir, type ExtensionAPI, type ModelRegistry } from "@earendil-works/pi-coding-agent";
+import modelsData from "./models.json" with { type: "json" };
+import customModelsData from "./custom-models.json" with { type: "json" };
+import patchData from "./patch.json" with { type: "json" };
+import fs from "fs";
+import path from "path";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface JsonModel {
+  id: string;
+  name: string;
+  reasoning: boolean;
+  input: ("text" | "image")[];
+  cost: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
+  contextWindow: number;
+  maxTokens: number;
+  thinkingLevelMap?: Record<string, string | null>;
+  compat?: {
+    supportsStore?: boolean;
+    supportsDeveloperRole?: boolean;
+    maxTokensField?: "max_completion_tokens" | "max_tokens";
+    thinkingFormat?: "openai" | "openrouter" | "together" | "deepseek" | "zai" | "qwen" | "chat-template" | "qwen-chat-template" | "string-thinking" | "ant-ling";
+    supportsReasoningEffort?: boolean;
+    requiresReasoningContentOnAssistantMessages?: boolean;
+  };
+}
+
+interface PatchEntry {
+  name?: string;
+  reasoning?: boolean;
+  input?: ("text" | "image")[];
+  cost?: {
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+  };
+  contextWindow?: number;
+  maxTokens?: number;
+  thinkingLevelMap?: Record<string, string | null>;
+  compat?: Record<string, unknown>;
+}
+
+type PatchData = Record<string, PatchEntry>;
+
+// ─── Patch Application ────────────────────────────────────────────────────────
+
+function applyPatch(model: JsonModel, patch: PatchEntry): JsonModel {
+  const result = { ...model };
+
+  if (patch.name !== undefined) result.name = patch.name;
+  if (patch.reasoning !== undefined) result.reasoning = patch.reasoning;
+  if (patch.input !== undefined) result.input = patch.input;
+  if (patch.contextWindow !== undefined) result.contextWindow = patch.contextWindow;
+  if (patch.maxTokens !== undefined) result.maxTokens = patch.maxTokens;
+  if (patch.thinkingLevelMap !== undefined) result.thinkingLevelMap = { ...patch.thinkingLevelMap };
+
+  if (patch.cost) {
+    result.cost = {
+      input: patch.cost.input ?? result.cost.input,
+      output: patch.cost.output ?? result.cost.output,
+      cacheRead: patch.cost.cacheRead ?? result.cost.cacheRead,
+      cacheWrite: patch.cost.cacheWrite ?? result.cost.cacheWrite,
+    };
+  }
+  if (patch.compat) {
+    result.compat = { ...(result.compat || {}), ...patch.compat };
+  }
+
+  if (!result.reasoning && result.compat?.thinkingFormat) {
+    delete result.compat.thinkingFormat;
+  }
+  if (result.compat && Object.keys(result.compat).length === 0) {
+    delete result.compat;
+  }
+
+  return result;
+}
+
+/** Full pipeline: base models -> patch -> custom -> result */
+function buildModels(base: JsonModel[], custom: JsonModel[], patch: PatchData): JsonModel[] {
+  const modelMap = new Map<string, JsonModel>();
+
+  for (const model of base) {
+    modelMap.set(model.id, model);
+  }
+
+  for (const [id, patchEntry] of Object.entries(patch)) {
+    const existing = modelMap.get(id);
+    if (existing) {
+      modelMap.set(id, applyPatch(existing, patchEntry));
+    }
+  }
+
+  for (const model of custom) {
+    const existing = modelMap.get(model.id);
+    const patchEntry = patch[model.id];
+    if (existing && patchEntry) {
+      modelMap.set(model.id, applyPatch(model, patchEntry));
+    } else if (existing) {
+      modelMap.set(model.id, model);
+    } else if (patchEntry) {
+      modelMap.set(model.id, applyPatch(model, patchEntry));
+    } else {
+      modelMap.set(model.id, model);
+    }
+  }
+
+  return Array.from(modelMap.values());
+}
+
+// ─── Stale-While-Revalidate Model Sync ────────────────────────────────────────
+
+const PROVIDER_ID = "zyloo";
+const BASE_URL = "https://api.zyloo.io/v1";
+const MODELS_URL = `${BASE_URL}/models`;
+const CACHE_DIR = path.join(getAgentDir(), "cache");
+const CACHE_PATH = path.join(CACHE_DIR, `${PROVIDER_ID}-models.json`);
+const LIVE_FETCH_TIMEOUT_MS = 8000;
+
+/** Transform a model from the Zyloo /v1/models API. */
+function transformApiModel(apiModel: any): JsonModel | null {
+  // Skip non-chat models (embeddings, audio, etc.) if any appear in the future.
+  const skipIds = new Set<string>([]);
+  if (skipIds.has(apiModel.id)) return null;
+
+  const id = apiModel.id;
+  const parts = id.split("/");
+  const rawName = parts.length > 1 ? parts.slice(1).join("/") : id;
+
+  return {
+    id,
+    name: rawName.replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase()),
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 131072,
+    maxTokens: 131072,
+  };
+}
+
+async function fetchLiveModels(apiKey: string, signal?: AbortSignal): Promise<JsonModel[] | null> {
+  try {
+    const response = await fetch(MODELS_URL, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(LIVE_FETCH_TIMEOUT_MS), signal]) : AbortSignal.timeout(LIVE_FETCH_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const apiModels = Array.isArray(data) ? data : (data.data || []);
+    if (!Array.isArray(apiModels) || apiModels.length === 0) return null;
+    return apiModels.map(transformApiModel).filter((m): m is JsonModel => m !== null);
+  } catch {
+    return null;
+  }
+}
+
+function loadCachedModels(): JsonModel[] | null {
+  try {
+    const data = JSON.parse(fs.readFileSync(CACHE_PATH, "utf8"));
+    return Array.isArray(data) ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+function cacheModels(models: JsonModel[]): void {
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(CACHE_PATH, JSON.stringify(models, null, 2) + "\n");
+  } catch {
+    // Cache write failure is non-fatal
+  }
+}
+
+function mergeWithEmbedded(liveModels: JsonModel[], embeddedModels: JsonModel[]): JsonModel[] {
+  const embeddedMap = new Map(embeddedModels.map(m => [m.id, m]));
+  const seen = new Set<string>();
+  const result: JsonModel[] = [];
+  for (const liveModel of liveModels) {
+    const embedded = embeddedMap.get(liveModel.id);
+    seen.add(liveModel.id);
+    if (embedded) {
+      // Self-heal: live API pricing is authoritative field-by-field. Prefer the
+      // live cost when the API reports it (non-zero); fall back to embedded when
+      // the API is silent (0) so curated cacheRead/cacheWrite isn't clobbered and
+      // providers whose /models endpoint exposes no pricing keep their curated
+      // cost. Curation (reasoning/input/compat/name) still wins via ...embedded.
+      result.push({
+        ...liveModel,
+        ...embedded,
+        cost: {
+          input: liveModel.cost.input || embedded.cost.input,
+          output: liveModel.cost.output || embedded.cost.output,
+          cacheRead: liveModel.cost.cacheRead || embedded.cost.cacheRead,
+          cacheWrite: liveModel.cost.cacheWrite || embedded.cost.cacheWrite,
+        },
+        contextWindow: liveModel.contextWindow || embedded.contextWindow,
+      });
+    } else {
+      result.push(liveModel);
+    }
+  }
+  for (const em of embeddedModels) {
+    if (!seen.has(em.id)) {
+      result.push(em);
+    }
+  }
+  return result;
+}
+
+function loadStaleModels(embeddedModels: JsonModel[]): JsonModel[] {
+  const cached = loadCachedModels();
+  if (!cached || cached.length === 0) return embeddedModels;
+
+  const cachedMap = new Map(cached.map(m => [m.id, m]));
+  for (const em of embeddedModels) {
+    if (!cachedMap.has(em.id)) {
+      cached.push(em);
+    }
+  }
+  return cached;
+}
+
+async function revalidateModels(apiKey: string | undefined, embeddedModels: JsonModel[], signal?: AbortSignal): Promise<JsonModel[] | null> {
+  if (!apiKey) return null;
+  const liveModels = await fetchLiveModels(apiKey, signal);
+  if (!liveModels || liveModels.length === 0) return null;
+  const merged = mergeWithEmbedded(liveModels, embeddedModels);
+  cacheModels(merged);
+  return merged;
+}
+
+// ─── API Key Resolution (via ModelRegistry) ────────────────────────────────────
+
+let cachedApiKey: string | undefined;
+let revalidateAbort: AbortController | null = null;
+
+async function resolveApiKey(modelRegistry: ModelRegistry): Promise<void> {
+  cachedApiKey = await modelRegistry.getApiKeyForProvider("zyloo") ?? undefined;
+}
+
+// ─── Extension Entry Point ────────────────────────────────────────────────────
+
+export default function (pi: ExtensionAPI) {
+  const embeddedModels = modelsData as JsonModel[];
+  const customModels = customModelsData as JsonModel[];
+  const patches = patchData as PatchData;
+
+  const staleBase = loadStaleModels(embeddedModels);
+  const staleModels = buildModels(staleBase, customModels, patches);
+
+  pi.registerProvider("zyloo", {
+    baseUrl: BASE_URL,
+    apiKey: "$ZYLOO_API_KEY",
+    api: "openai-completions",
+    models: staleModels,
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    revalidateAbort?.abort();
+    revalidateAbort = new AbortController();
+    const signal = revalidateAbort.signal;
+    resolveApiKey(ctx.modelRegistry).then(() => {
+      revalidateModels(cachedApiKey, embeddedModels, signal).then((freshBase) => {
+        if (freshBase && !signal.aborted) {
+          pi.registerProvider("zyloo", {
+            baseUrl: BASE_URL,
+            apiKey: "$ZYLOO_API_KEY",
+            api: "openai-completions",
+            models: buildModels(freshBase, customModels, patches),
+          });
+        }
+      });
+    });
+  });
+
+  pi.on("session_shutdown", () => {
+    revalidateAbort?.abort();
+  });
+}
