@@ -27,8 +27,29 @@
     "qwen",
     "minimax"
   ],
-  "author": "",
+  "author": "monotykamary",
   "license": "MIT",
+  "homepage": "https://github.com/monotykamary/pi-zyloo-provider#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/monotykamary/pi-zyloo-provider.git"
+  },
+  "bugs": {
+    "url": "https://github.com/monotykamary/pi-zyloo-provider/issues"
+  },
+  "files": [
+    "index.ts",
+    "models.json",
+    "custom-models.json",
+    "patch.json",
+    "scripts/update-models.js",
+    "README.md",
+    "LICENSE",
+    "AGENTS.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "pi": {
     "extensions": [
       "./index.ts"

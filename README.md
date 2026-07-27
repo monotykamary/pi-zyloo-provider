@@ -7,6 +7,7 @@
 _Claude, GPT, Gemini, Grok, Kimi, GLM, DeepSeek, Qwen & MiniMax — one OpenAI-compatible endpoint for [pi](https://github.com/earendil-works/pi-coding-agent)._
 
 [![pi extension](https://img.shields.io/badge/pi-extension-blueviolet)](https://github.com/earendil-works/pi-coding-agent)
+[![npm version](https://img.shields.io/npm/v/pi-zyloo-provider)](https://www.npmjs.com/package/pi-zyloo-provider)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 </div>
@@ -123,6 +124,20 @@ Get your API key from [zyloo.io](https://zyloo.io).
    ```bash
    pi -e /path/to/pi-zyloo-provider
    ```
+
+### Option 3: Via npm
+
+Install the package from npm:
+```bash
+npm install pi-zyloo-provider
+# or
+pnpm add pi-zyloo-provider
+```
+
+Then load it by path (npm installs into `node_modules`):
+```bash
+pi -e ./node_modules/pi-zyloo-provider
+```
 
 ## Authentication
 
