@@ -1,6 +1,6 @@
 {
   "name": "pi-zyloo-provider",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Zyloo provider extension for pi - Claude, GPT, Gemini, Grok, Kimi, GLM, DeepSeek, Qwen & MiniMax through the Zyloo OpenAI-compatible API",
   "type": "module",
   "main": "index.ts",
